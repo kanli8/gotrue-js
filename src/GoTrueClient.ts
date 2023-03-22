@@ -1,5 +1,11 @@
 import GoTrueAdminApi from './GoTrueAdminApi'
-import { DEFAULT_HEADERS, EXPIRY_MARGIN, GOTRUE_URL, STORAGE_KEY } from './lib/constants'
+import {
+  DEFAULT_HEADERS,
+  EXPIRY_MARGIN,
+  GOTRUE_URL,
+  STORAGE_KEY,
+  TOKEN_REFRESH_TYPE,
+} from './lib/constants'
 import {
   AuthError,
   AuthImplicitGrantRedirectError,
@@ -63,6 +69,7 @@ import type {
   AuthenticatorAssuranceLevels,
   Factor,
   MFAChallengeAndVerifyParams,
+  TokenRefreshType,
 } from './lib/types'
 
 polyfillGlobalThis() // Make "globalThis" available
@@ -74,6 +81,7 @@ const DEFAULT_OPTIONS: Omit<Required<GoTrueClientOptions>, 'fetch' | 'storage'> 
   persistSession: true,
   detectSessionInUrl: true,
   headers: DEFAULT_HEADERS,
+  tokenRefreshType: TOKEN_REFRESH_TYPE,
 }
 
 /** Current session will be checked for refresh at this interval. */
@@ -105,6 +113,7 @@ export default class GoTrueClient {
   protected inMemorySession: Session | null
 
   protected autoRefreshToken: boolean
+  protected tokenRefreshType: TokenRefreshType
   protected persistSession: boolean
   protected storage: SupportedStorage
   protected stateChangeEmitters: Map<string, Subscription> = new Map()
@@ -138,6 +147,7 @@ export default class GoTrueClient {
     this.inMemorySession = null
     this.storageKey = settings.storageKey
     this.autoRefreshToken = settings.autoRefreshToken
+    this.tokenRefreshType = settings.tokenRefreshType
     this.persistSession = settings.persistSession
     this.storage = settings.storage || localStorageAdapter
     this.admin = new GoTrueAdminApi({
@@ -556,6 +566,41 @@ export default class GoTrueClient {
     } catch (error) {
       if (isAuthError(error)) {
         return { data: null, error }
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Wechat authorized login
+   */
+  async signInWithWeChatCode(code: string): Promise<AuthResponse> {
+    try {
+      await this._removeSession()
+
+      const res: AuthResponse = await _request(
+        this.fetch,
+        'POST',
+        `${this.url}/wechatAppletSignUp`,
+        {
+          headers: this.headers,
+          body: {
+            code,
+          },
+          xform: _sessionResponse,
+        }
+      )
+
+      const { data, error } = res
+      if (error || !data) return { data: { user: null, session: null }, error }
+      if (data.session) {
+        await this._saveSession(data.session)
+        this._notifyAllSubscribers('SIGNED_IN', data.session)
+      }
+      return { data, error }
+    } catch (error) {
+      if (isAuthError(error)) {
+        return { data: { user: null, session: null }, error }
       }
       throw error
     }
@@ -982,6 +1027,19 @@ export default class GoTrueClient {
       return await retryable(
         async (attempt) => {
           await sleep(attempt * 200) // 0, 200, 400, 800, ...
+
+          if (this.tokenRefreshType == 'WeChat') {
+            return await _request(
+              this.fetch,
+              'POST',
+              `${this.url}/wechatAppletToken?grant_type=refresh_token`,
+              {
+                body: { refresh_token: refreshToken },
+                headers: this.headers,
+                xform: _sessionResponse,
+              }
+            )
+          }
 
           return await _request(this.fetch, 'POST', `${this.url}/token?grant_type=refresh_token`, {
             body: { refresh_token: refreshToken },

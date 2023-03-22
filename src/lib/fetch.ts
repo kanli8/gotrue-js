@@ -8,6 +8,7 @@ import {
   UserResponse,
 } from './types'
 import { AuthApiError, AuthRetryableFetchError, AuthUnknownError } from './errors'
+import { fetch } from './uniFetch'
 
 export type Fetch = typeof fetch
 
@@ -112,13 +113,12 @@ async function _handleRequest(
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     fetcher(url, _getRequestParams(method, options, parameters, body))
-      .then((result) => {
-        if (!result.ok) throw result
-        if (options?.noResolveJson) return result
-        return result.json()
+      .then((res: any) => {
+        resolve(res.data)
       })
-      .then((data) => resolve(data))
-      .catch((error) => handleError(error, reject))
+      .catch((error) => {
+        handleError(error, reject)
+      })
   })
 }
 

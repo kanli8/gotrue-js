@@ -1,4 +1,5 @@
 import { SupportedStorage } from './types'
+import { fetch } from './uniFetch'
 
 export function expiresAt(expiresIn: number) {
   const timeNow = Math.round(Date.now() / 1000)
@@ -78,7 +79,7 @@ export const resolveFetch = (customFetch?: Fetch): Fetch => {
   if (customFetch) {
     _fetch = customFetch
   } else if (typeof fetch === 'undefined') {
-    _fetch = async (...args) => await (await import('cross-fetch')).fetch(...args)
+    _fetch = fetch as unknown as Fetch
   } else {
     _fetch = fetch
   }

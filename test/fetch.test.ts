@@ -1,5 +1,5 @@
 import { MockServer } from 'jest-mock-server'
-import fetch from 'cross-fetch'
+import { fetch } from '../src/lib/uniFetch'
 import { AuthUnknownError, AuthApiError, AuthRetryableFetchError } from '../src/lib/errors'
 import { _request } from '../src/lib/fetch'
 

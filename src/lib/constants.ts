@@ -8,3 +8,4 @@ export const NETWORK_FAILURE = {
   MAX_RETRIES: 10,
   RETRY_INTERVAL: 2, // in deciseconds
 }
+export const TOKEN_REFRESH_TYPE = 'WeChat'
