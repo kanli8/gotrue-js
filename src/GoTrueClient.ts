@@ -1116,7 +1116,7 @@ export default class GoTrueClient {
           const { error } = await this._callRefreshToken(currentSession.refresh_token)
 
           if (error) {
-            console.log(error.message)
+            // console.log(error.message)
             await this._removeSession()
           }
         } else {
