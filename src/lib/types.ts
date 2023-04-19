@@ -31,7 +31,7 @@ export type AuthChangeEvent =
   | 'USER_DELETED'
   | AuthChangeEventMFA
 
-export type TokenRefreshType = 'WeChat'
+export type TokenRefreshType = 'WeChat' | 'Phone'
 
 export type GoTrueClientOptions = {
   /* The URL of the GoTrue server. */
@@ -44,7 +44,7 @@ export type GoTrueClientOptions = {
   detectSessionInUrl?: boolean
   /* Set to "true" if you want to automatically refresh the token before expiring. */
   autoRefreshToken?: boolean
-  /** Token refresh mode   */
+  /* Token refresh mode   */
   tokenRefreshType: TokenRefreshType
   /* Set to "true" if you want to automatically save the user session into local storage. If set to false, session will just be saved in memory. */
   persistSession?: boolean

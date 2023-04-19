@@ -607,6 +607,42 @@ export default class GoTrueClient {
   }
 
   /**
+   * Mobile phone number one-click login
+   */
+  async signInWithPhone(openid: string, access_token: string): Promise<AuthResponse> {
+    try {
+      await this._removeSession()
+
+      const res: AuthResponse = await _request(
+        this.fetch,
+        'POST',
+        `${this.url}/phoneOneClickSignUp`,
+        {
+          headers: this.headers,
+          body: {
+            openid,
+            access_token,
+          },
+          xform: _sessionResponse,
+        }
+      )
+
+      const { data, error } = res
+      if (error || !data) return { data: { user: null, session: null }, error }
+      if (data.session) {
+        await this._saveSession(data.session)
+        this._notifyAllSubscribers('SIGNED_IN', data.session)
+      }
+      return { data, error }
+    } catch (error) {
+      if (isAuthError(error)) {
+        return { data: { user: null, session: null }, error }
+      }
+      throw error
+    }
+  }
+
+  /**
    * Returns the session, refreshing it if necessary.
    * The session returned can be null if the session is not detected which can happen in the event a user is not signed-in or has logged out.
    */
@@ -1033,6 +1069,19 @@ export default class GoTrueClient {
               this.fetch,
               'POST',
               `${this.url}/wechatAppletToken?grant_type=refresh_token`,
+              {
+                body: { refresh_token: refreshToken },
+                headers: this.headers,
+                xform: _sessionResponse,
+              }
+            )
+          }
+
+          if (this.tokenRefreshType == 'Phone') {
+            return await _request(
+              this.fetch,
+              'POST',
+              `${this.url}/phoneOneClickToken?grant_type=refresh_token`,
               {
                 body: { refresh_token: refreshToken },
                 headers: this.headers,
