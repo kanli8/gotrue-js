@@ -9,6 +9,7 @@ import {
 import {
   AuthError,
   AuthImplicitGrantRedirectError,
+  AuthPKCEGrantCodeExchangeError,
   AuthInvalidCredentialsError,
   AuthRetryableFetchError,
   AuthSessionMissingError,
@@ -29,9 +30,12 @@ import {
   uuid,
   retryable,
   sleep,
+  generatePKCEVerifier,
+  generatePKCEChallenge,
 } from './lib/helpers'
 import localStorageAdapter from './lib/local-storage'
 import { polyfillGlobalThis } from './lib/polyfills'
+
 import type {
   AuthChangeEvent,
   AuthResponse,
@@ -70,6 +74,7 @@ import type {
   Factor,
   MFAChallengeAndVerifyParams,
   TokenRefreshType,
+  AuthFlowType,
 } from './lib/types'
 
 polyfillGlobalThis() // Make "globalThis" available
@@ -82,6 +87,7 @@ const DEFAULT_OPTIONS: Omit<Required<GoTrueClientOptions>, 'fetch' | 'storage'> 
   detectSessionInUrl: true,
   headers: DEFAULT_HEADERS,
   tokenRefreshType: TOKEN_REFRESH_TYPE,
+  flowType: 'implicit',
 }
 
 /** Current session will be checked for refresh at this interval. */
@@ -111,6 +117,8 @@ export default class GoTrueClient {
    * Only used if persistSession is false.
    */
   protected inMemorySession: Session | null
+
+  protected flowType: AuthFlowType
 
   protected autoRefreshToken: boolean
   protected tokenRefreshType: TokenRefreshType
@@ -160,6 +168,7 @@ export default class GoTrueClient {
     this.headers = settings.headers
     this.fetch = resolveFetch(settings.fetch)
     this.detectSessionInUrl = settings.detectSessionInUrl
+    this.flowType = settings.flowType
 
     this.mfa = {
       verify: this._verify.bind(this),
@@ -172,8 +181,16 @@ export default class GoTrueClient {
     }
 
     if (isBrowser() && globalThis.BroadcastChannel && this.persistSession && this.storageKey) {
-      this.broadcastChannel = new globalThis.BroadcastChannel(this.storageKey)
-      this.broadcastChannel.addEventListener('message', (event) => {
+      try {
+        this.broadcastChannel = new globalThis.BroadcastChannel(this.storageKey)
+      } catch (e: any) {
+        console.error(
+          'Failed to create a new BroadcastChannel, multi-tab state changes will not be available',
+          e
+        )
+      }
+
+      this.broadcastChannel?.addEventListener('message', (event) => {
         this._notifyAllSubscribers(event.data.event, event.data.session, false) // broadcast = false so we don't get an endless loop of messages
       })
     }
@@ -206,9 +223,9 @@ export default class GoTrueClient {
     }
 
     try {
-      if (this.detectSessionInUrl && this._isImplicitGrantFlow()) {
-        const { data, error } = await this._getSessionFromUrl()
-
+      const isPKCEFlow = await this._isPKCEFlow()
+      if ((this.detectSessionInUrl && this._isImplicitGrantFlow()) || isPKCEFlow) {
+        const { data, error } = await this._getSessionFromUrl(isPKCEFlow)
         if (error) {
           // failed login attempt via url,
           // remove old session as in verifyOtp, signUp and signInWith*
@@ -222,9 +239,10 @@ export default class GoTrueClient {
         await this._saveSession(session)
 
         setTimeout(() => {
-          this._notifyAllSubscribers('SIGNED_IN', session)
           if (redirectType === 'recovery') {
             this._notifyAllSubscribers('PASSWORD_RECOVERY', session)
+          } else {
+            this._notifyAllSubscribers('SIGNED_IN', session)
           }
         }, 0)
 
@@ -263,6 +281,14 @@ export default class GoTrueClient {
       let res: AuthResponse
       if ('email' in credentials) {
         const { email, password, options } = credentials
+        let codeChallenge: string | null = null
+        let codeChallengeMethod: string | null = null
+        if (this.flowType === 'pkce') {
+          const codeVerifier = generatePKCEVerifier()
+          await setItemAsync(this.storage, `${this.storageKey}-code-verifier`, codeVerifier)
+          codeChallenge = await generatePKCEChallenge(codeVerifier)
+          codeChallengeMethod = codeVerifier === codeChallenge ? 'plain' : 's256'
+        }
         res = await _request(this.fetch, 'POST', `${this.url}/signup`, {
           headers: this.headers,
           redirectTo: options?.emailRedirectTo,
@@ -271,6 +297,8 @@ export default class GoTrueClient {
             password,
             data: options?.data ?? {},
             gotrue_meta_security: { captcha_token: options?.captchaToken },
+            code_challenge: codeChallenge,
+            code_challenge_method: codeChallengeMethod,
           },
           xform: _sessionResponse,
         })
@@ -282,6 +310,7 @@ export default class GoTrueClient {
             phone,
             password,
             data: options?.data ?? {},
+            channel: options?.channel ?? 'sms',
             gotrue_meta_security: { captcha_token: options?.captchaToken },
           },
           xform: _sessionResponse,
@@ -319,13 +348,10 @@ export default class GoTrueClient {
   /**
    * Log in an existing user with an email and password or phone and password.
    *
-   * Be aware that you may get back an error message that will not distingish
+   * Be aware that you may get back an error message that will not distinguish
    * between the cases where the account does not exist or that the
    * email/phone and password combination is wrong or that the account can only
-   * be accessed via social login. Do note that you will need
-   * to configure a Whatsapp sender on Twilio if you are using phone sign in
-   * with 'whatsapp'. The whatsapp channel is not supported on other providers
-   * at this time.
+   * be accessed via social login.
    */
   async signInWithPassword(credentials: SignInWithPasswordCredentials): Promise<AuthResponse> {
     try {
@@ -351,7 +377,6 @@ export default class GoTrueClient {
             phone,
             password,
             gotrue_meta_security: { captcha_token: options?.captchaToken },
-            channel: options?.channel ?? 'sms',
           },
           xform: _sessionResponse,
         })
@@ -380,12 +405,40 @@ export default class GoTrueClient {
    */
   async signInWithOAuth(credentials: SignInWithOAuthCredentials): Promise<OAuthResponse> {
     await this._removeSession()
-    return this._handleProviderSignIn(credentials.provider, {
+
+    return await this._handleProviderSignIn(credentials.provider, {
       redirectTo: credentials.options?.redirectTo,
       scopes: credentials.options?.scopes,
       queryParams: credentials.options?.queryParams,
       skipBrowserRedirect: credentials.options?.skipBrowserRedirect,
     })
+  }
+
+  /**
+   * Log in an existing user via a third-party provider.
+   */
+  async exchangeCodeForSession(authCode: string): Promise<AuthResponse> {
+    const codeVerifier = await getItemAsync(this.storage, `${this.storageKey}-code-verifier`)
+    const { data, error } = await _request(
+      this.fetch,
+      'POST',
+      `${this.url}/token?grant_type=pkce`,
+      {
+        headers: this.headers,
+        body: {
+          auth_code: authCode,
+          code_verifier: codeVerifier,
+        },
+        xform: _sessionResponse,
+      }
+    )
+    await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
+    if (error || !data) return { data: { user: null, session: null }, error }
+    if (data.session) {
+      await this._saveSession(data.session)
+      this._notifyAllSubscribers('SIGNED_IN', data.session)
+    }
+    return { data, error }
   }
 
   /**
@@ -448,6 +501,14 @@ export default class GoTrueClient {
 
       if ('email' in credentials) {
         const { email, options } = credentials
+        let codeChallenge: string | null = null
+        let codeChallengeMethod: string | null = null
+        if (this.flowType === 'pkce') {
+          const codeVerifier = generatePKCEVerifier()
+          await setItemAsync(this.storage, `${this.storageKey}-code-verifier`, codeVerifier)
+          codeChallenge = await generatePKCEChallenge(codeVerifier)
+          codeChallengeMethod = codeVerifier === codeChallenge ? 'plain' : 's256'
+        }
         const { error } = await _request(this.fetch, 'POST', `${this.url}/otp`, {
           headers: this.headers,
           body: {
@@ -455,6 +516,8 @@ export default class GoTrueClient {
             data: options?.data ?? {},
             create_user: options?.shouldCreateUser ?? true,
             gotrue_meta_security: { captcha_token: options?.captchaToken },
+            code_challenge: codeChallenge,
+            code_challenge_method: codeChallengeMethod,
           },
           redirectTo: options?.emailRedirectTo,
         })
@@ -490,7 +553,6 @@ export default class GoTrueClient {
   async verifyOtp(params: VerifyOtpParams): Promise<AuthResponse> {
     try {
       await this._removeSession()
-
       const { data, error } = await _request(this.fetch, 'POST', `${this.url}/verify`, {
         headers: this.headers,
         body: {
@@ -506,7 +568,7 @@ export default class GoTrueClient {
       }
 
       if (!data) {
-        throw 'An error occurred on token verification.'
+        throw new Error('An error occurred on token verification.')
       }
 
       const session: Session | null = data.session
@@ -540,11 +602,6 @@ export default class GoTrueClient {
    *
    * If you have built an organization-specific login page, you can use the
    * organization's SSO Identity Provider UUID directly instead.
-   *
-   * This API is experimental and availability is conditional on correct
-   * settings on the Auth service.
-   *
-   * @experimental
    */
   async signInWithSSO(params: SignInWithSSO): Promise<SSOResponse> {
     try {
@@ -892,7 +949,7 @@ export default class GoTrueClient {
   /**
    * Gets the session data from a URL string
    */
-  private async _getSessionFromUrl(): Promise<
+  private async _getSessionFromUrl(isPKCEFlow: boolean): Promise<
     | {
         data: { session: Session; redirectType: string | null }
         error: null
@@ -901,8 +958,18 @@ export default class GoTrueClient {
   > {
     try {
       if (!isBrowser()) throw new AuthImplicitGrantRedirectError('No browser detected.')
-      if (!this._isImplicitGrantFlow()) {
+      if (this.flowType === 'implicit' && !this._isImplicitGrantFlow()) {
         throw new AuthImplicitGrantRedirectError('Not a valid implicit grant flow url.')
+      } else if (this.flowType == 'pkce' && !isPKCEFlow) {
+        throw new AuthPKCEGrantCodeExchangeError('Not a valid PKCE flow url.')
+      }
+      if (isPKCEFlow) {
+        const authCode = getParameterByName('code')
+        if (!authCode) throw new AuthPKCEGrantCodeExchangeError('No code detected.')
+        const { data, error } = await this.exchangeCodeForSession(authCode)
+        if (error) throw error
+        if (!data.session) throw new AuthPKCEGrantCodeExchangeError('No session detected.')
+        return { data: { session: data.session, redirectType: null }, error: null }
       }
 
       const error_description = getParameterByName('error_description')
@@ -967,6 +1034,16 @@ export default class GoTrueClient {
         Boolean(getParameterByName('error_description')))
     )
   }
+  /**
+   * Checks if the current URL and backing storage contain parameters given by a PKCE flow
+   */
+  private async _isPKCEFlow(): Promise<boolean> {
+    const currentStorageContent = await getItemAsync(
+      this.storage,
+      `${this.storageKey}-code-verifier`
+    )
+    return isBrowser() && Boolean(getParameterByName('code')) && Boolean(currentStorageContent)
+  }
 
   /**
    * Inside a browser context, `signOut()` will remove the logged in user from the browser session
@@ -992,6 +1069,7 @@ export default class GoTrueClient {
       }
     }
     await this._removeSession()
+    await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
     this._notifyAllSubscribers('SIGNED_OUT', null)
     return { error: null }
   }
@@ -1014,7 +1092,24 @@ export default class GoTrueClient {
 
     this.stateChangeEmitters.set(id, subscription)
 
+    this.emitInitialSession(id)
+
     return { data: { subscription } }
+  }
+
+  private async emitInitialSession(id: string): Promise<void> {
+    try {
+      const {
+        data: { session },
+        error,
+      } = await this.getSession()
+      if (error) throw error
+
+      this.stateChangeEmitters.get(id)?.callback('INITIAL_SESSION', session)
+    } catch (err) {
+      this.stateChangeEmitters.get(id)?.callback('INITIAL_SESSION', null)
+      console.error(err)
+    }
   }
 
   /**
@@ -1036,9 +1131,22 @@ export default class GoTrueClient {
       }
     | { data: null; error: AuthError }
   > {
+    let codeChallenge: string | null = null
+    let codeChallengeMethod: string | null = null
+    if (this.flowType === 'pkce') {
+      const codeVerifier = generatePKCEVerifier()
+      await setItemAsync(this.storage, `${this.storageKey}-code-verifier`, codeVerifier)
+      codeChallenge = await generatePKCEChallenge(codeVerifier)
+      codeChallengeMethod = codeVerifier === codeChallenge ? 'plain' : 's256'
+    }
     try {
       return await _request(this.fetch, 'POST', `${this.url}/recover`, {
-        body: { email, gotrue_meta_security: { captcha_token: options.captchaToken } },
+        body: {
+          email,
+          code_challenge: codeChallenge,
+          code_challenge_method: codeChallengeMethod,
+          gotrue_meta_security: { captcha_token: options.captchaToken },
+        },
         headers: this.headers,
         redirectTo: options.redirectTo,
       })
@@ -1122,16 +1230,16 @@ export default class GoTrueClient {
     return isValidSession
   }
 
-  private _handleProviderSignIn(
+  private async _handleProviderSignIn(
     provider: Provider,
     options: {
       redirectTo?: string
       scopes?: string
       queryParams?: { [key: string]: string }
       skipBrowserRedirect?: boolean
-    } = {}
+    }
   ) {
-    const url: string = this._getUrlForProvider(provider, {
+    const url: string = await this._getUrlForProvider(provider, {
       redirectTo: options.redirectTo,
       scopes: options.scopes,
       queryParams: options.queryParams,
@@ -1140,6 +1248,7 @@ export default class GoTrueClient {
     if (isBrowser() && !options.skipBrowserRedirect) {
       window.location.assign(url)
     }
+
     return { data: { provider, url }, error: null }
   }
 
@@ -1294,6 +1403,12 @@ export default class GoTrueClient {
       // finished and tests run endlessly. This can be prevented by calling
       // `unref()` on the returned object.
       ticker.unref()
+      // @ts-ignore
+    } else if (typeof Deno !== 'undefined' && typeof Deno.unrefTimer === 'function') {
+      // similar like for NodeJS, but with the Deno API
+      // https://deno.land/api@latest?unstable&s=Deno.unrefTimer
+      // @ts-ignore
+      Deno.unrefTimer(ticker)
     }
 
     // run the tick immediately
@@ -1438,7 +1553,7 @@ export default class GoTrueClient {
    * @param options.scopes A space-separated list of scopes granted to the OAuth application.
    * @param options.queryParams An object of key-value pairs containing query parameters granted to the OAuth application.
    */
-  private _getUrlForProvider(
+  private async _getUrlForProvider(
     provider: Provider,
     options: {
       redirectTo?: string
@@ -1453,10 +1568,22 @@ export default class GoTrueClient {
     if (options?.scopes) {
       urlParams.push(`scopes=${encodeURIComponent(options.scopes)}`)
     }
+    if (this.flowType === 'pkce') {
+      const codeVerifier = generatePKCEVerifier()
+      await setItemAsync(this.storage, `${this.storageKey}-code-verifier`, codeVerifier)
+      const codeChallenge = await generatePKCEChallenge(codeVerifier)
+      const codeChallengeMethod = codeVerifier === codeChallenge ? 'plain' : 's256'
+      const flowParams = new URLSearchParams({
+        code_challenge: `${encodeURIComponent(codeChallenge)}`,
+        code_challenge_method: `${encodeURIComponent(codeChallengeMethod)}`,
+      })
+      urlParams.push(flowParams.toString())
+    }
     if (options?.queryParams) {
       const query = new URLSearchParams(options.queryParams)
       urlParams.push(query.toString())
     }
+
     return `${this.url}/authorize?${urlParams.join('&')}`
   }
 
